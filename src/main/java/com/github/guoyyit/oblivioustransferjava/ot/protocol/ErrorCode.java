@@ -1,0 +1,27 @@
+package com.github.guoyyit.oblivioustransferjava.ot.protocol;
+
+/**
+ * 协议双方对失败原因给出的可区分判定结果。
+ */
+public enum ErrorCode {
+    INVALID_PARAMETER,
+    INVALID_STATE,
+    UNIMPLEMENTED,
+    SESSION_NOT_FOUND,
+    SESSION_CLOSED,
+    SESSION_ABORTED,
+    PEER_ABORTED,
+    SESSION_ID_REUSE,
+    MESSAGE_TAMPERED,
+    MESSAGE_TRUNCATED,
+    MESSAGE_REPLAY,
+    CROSS_SESSION_MESSAGE,
+    DECRYPTION_FAILED,
+    PROTOCOL_VIOLATION,
+    OUT_OF_RANGE,
+    INDEX_MISMATCH,
+    ALREADY_REDEEMED,
+    CANCELLED,
+    TIMEOUT,
+    INTERNAL_ERROR
+}
