@@ -86,7 +86,15 @@ public final class BatchReceiver extends ProtocolEndpoint {
             this.n = totalN;
             this.cursor = 0;
 
-            byte[] commitment = SymCrypto.sha256(buildCommitmentMaterial(totalN, choices));
+            byte[] salt = new byte[32];
+            random.nextBytes(salt);
+            byte[] commitment;
+            try {
+                commitment = SymCrypto.sha256(
+                        buildCommitmentMaterial(totalN, choices, salt));
+            } finally {
+                SymCrypto.wipe(salt);
+            }
             send(BatchMessages.MSG_COMMIT,
                     BatchMessages.encodeCommitment(totalN, commitment));
         } catch (OtException e) {
@@ -178,10 +186,17 @@ public final class BatchReceiver extends ProtocolEndpoint {
         abort(ErrorCode.CANCELLED, "接收方取消会话");
     }
 
-    private static byte[] buildCommitmentMaterial(int totalN, byte[] choices) {
-        ByteBuffer buffer = ByteBuffer.allocate(4 + choices.length);
+    /**
+     * 承诺材料：n、选择向量与一次性随机盐。盐不随消息发出，承诺对发送方
+     * 计算隐藏（无法穷举验证候选选择向量），且同一选择向量重复运行的承诺
+     * 不再相同。
+     */
+    private static byte[] buildCommitmentMaterial(int totalN, byte[] choices,
+                                                  byte[] salt) {
+        ByteBuffer buffer = ByteBuffer.allocate(4 + choices.length + salt.length);
         buffer.putInt(totalN);
         buffer.put(choices);
+        buffer.put(salt);
         return buffer.array();
     }
 

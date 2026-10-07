@@ -19,8 +19,19 @@ public final class StreamingPrg {
     }
 
     public static byte[] expand(byte[] seed, byte[] domain, int outputLength) {
+        return expand(seed, domain, 0L, outputLength);
+    }
+
+    /**
+     * 从全局流的 {@code skipBytes} 字节偏移处开始取 {@code outputLength} 字节，
+     * 使分批扩展与一次性扩展得到完全一致的比特流（批次边界不影响输出）。
+     */
+    public static byte[] expand(byte[] seed, byte[] domain, long skipBytes, int outputLength) {
         if (seed == null || seed.length == 0) {
             throw new OtException(ErrorCode.INVALID_PARAMETER, "PRG 种子不能为空");
+        }
+        if (skipBytes < 0) {
+            throw new OtException(ErrorCode.INVALID_PARAMETER, "PRG 偏移不能为负");
         }
         if (outputLength < 0) {
             throw new OtException(ErrorCode.INVALID_PARAMETER, "PRG 输出长度非法");
@@ -30,7 +41,8 @@ public final class StreamingPrg {
             mac.init(new javax.crypto.spec.SecretKeySpec(seed, "HmacSHA256"));
             byte[] output = new byte[outputLength];
             int filled = 0;
-            int counter = 0;
+            long counter = skipBytes / BLOCK_SIZE;
+            int blockOffset = (int) (skipBytes % BLOCK_SIZE);
             while (filled < outputLength) {
                 if (domain != null) {
                     mac.update(domain);
@@ -40,10 +52,11 @@ public final class StreamingPrg {
                 mac.update((byte) (counter >>> 8));
                 mac.update((byte) counter);
                 byte[] block = mac.doFinal();
-                int take = Math.min(BLOCK_SIZE, outputLength - filled);
-                System.arraycopy(block, 0, output, filled, take);
+                int take = Math.min(BLOCK_SIZE - blockOffset, outputLength - filled);
+                System.arraycopy(block, blockOffset, output, filled, take);
                 filled += take;
                 counter++;
+                blockOffset = 0;
             }
             return output;
         } catch (Exception e) {

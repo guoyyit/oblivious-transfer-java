@@ -8,18 +8,22 @@ import java.security.SecureRandom;
 import java.util.Arrays;
 
 /**
- * IKNP 随机 OT 扩展接收方（原版 κ 位向量构造）。
+ * IKNP 随机 OT 扩展接收方（PRG 掩码构造）。
  *
- * <p>为每个基础 OT j 生成随机 κ 位串 t0_j，并令 t1_j = t0_j ⊕ 1_κ
- * （全 1 翻转）。基础 OT 阶段把 (t0_j, t1_j) 作为两条消息交给发送方选择。
- * 扩展阶段对每列 j 发送两个矩阵列：
+ * <p>为每个基础 OT j 生成一对独立随机的 κ 位种子 (k0_j, k1_j)，并作为基础 OT
+ * 发送方把种子对交给扩展发送方按 s_j 选择。扩展阶段对每列 j 只发送一个
+ * 经 PRG 掩码的矩阵列：
  * <ul>
- *   <li>A：第 i 行固定为 t0_j；</li>
- *   <li>B：第 i 行为 t0_j ⊕ (r_i 重复 κ 位)，即 r_i=0 时为 t0_j，
- *       r_i=1 时为 t1_j。</li>
+ *   <li>t_j = G(k0_j)、g_j = G(k1_j)（全局比特流，按行主序每行 κ 位，
+ *       批 i 的起始偏移为 globalStart·κ/8 字节，批次边界不改变比特流）；</li>
+ *   <li>u_j = t_j ⊕ g_j ⊕ (r ⊗ 1_κ)，即第 i 行的 κ 位在 r_i=1 时整体翻转。</li>
  * </ul>
- * 行密钥：r_i=0 时跨列收集 t0_j 的第 j 位（等于发送方 R_i）；
- * r_i=1 时收集 t1_j 的第 j 位（等于发送方 R_i⊕s）。
+ * 发送方对 s_j=0 的列不知 k1_j、对 s_j=1 的列不知 k0_j，u_j 中始终残留一个
+ * 发送方无法计算的伪随机掩码，因此选择向量 r 对发送方计算隐藏（归约到 PRG
+ * 不可区分性，与逐次执行基础 OT 的安全强度一致）。
+ *
+ * <p>行密钥：第 i 行跨列收集 t_j 的第 (i·κ+j) 位组成行串 t^i 后散列；
+ * r_i=0 时 t^i 等于发送方 R_i，r_i=1 时等于 R_i⊕s。
  */
 public final class ExtensionReceiver {
 
@@ -27,8 +31,13 @@ public final class ExtensionReceiver {
     private final byte[] choices;
     private final SecureRandom random;
 
-    private byte[][] t0;
-    private byte[][] t1;
+    private byte[][] seed0;
+    private byte[][] seed1;
+
+    /** 当前批次的 T 矩阵列缓存（G(k0_j) 展开结果），供 deriveKey 按位读取。 */
+    private byte[][] cachedT;
+    private int cachedStart;
+    private int cachedLength;
 
     public ExtensionReceiver(int kappa, byte[] choices, SecureRandom random) {
         if (kappa <= 0 || kappa % 8 != 0) {
@@ -64,36 +73,43 @@ public final class ExtensionReceiver {
     }
 
     /**
-     * 生成 κ 对基础 OT 串（t0 随机，t1 为其按位取反）。
+     * 生成 κ 对基础 OT 种子（k0、k1 各自独立随机）。pairs[j][b] 即扩展发送方
+     * 选择位 s_j=b 时取回的种子。
      */
     public byte[][][] generateBasePairs() {
-        t0 = new byte[kappa][];
-        t1 = new byte[kappa][];
+        seed0 = new byte[kappa][];
+        seed1 = new byte[kappa][];
         byte[][][] pairs = new byte[kappa][2][];
         for (int j = 0; j < kappa; j++) {
-            t0[j] = new byte[seedBytes()];
-            random.nextBytes(t0[j]);
-            t1[j] = complement(t0[j]);
-            pairs[j][0] = t1[j].clone();
-            pairs[j][1] = t0[j].clone();
+            seed0[j] = new byte[seedBytes()];
+            random.nextBytes(seed0[j]);
+            seed1[j] = new byte[seedBytes()];
+            random.nextBytes(seed1[j]);
+            pairs[j][0] = seed0[j].clone();
+            pairs[j][1] = seed1[j].clone();
         }
         return pairs;
     }
 
     public void installBaseSeeds(byte[][] seedsZero, byte[][] seedsOne) {
-        t0 = new byte[kappa][];
-        t1 = new byte[kappa][];
+        seed0 = new byte[kappa][];
+        seed1 = new byte[kappa][];
         for (int j = 0; j < kappa; j++) {
-            t0[j] = seedsZero[j].clone();
-            t1[j] = seedsOne[j].clone();
+            seed0[j] = seedsZero[j].clone();
+            seed1[j] = seedsOne[j].clone();
         }
     }
 
     /**
-     * 生成一个扩展批次的 A/B 矩阵列（各 κ 列，行主序，每行 κ 位）。
+     * 生成一个扩展批次的掩码矩阵列（κ 列，行主序，每行 κ 位）。
+     *
+     * <p>返回的 {@code a} 为 u 矩阵（u_j = G(k0_j) ⊕ G(k1_j) ⊕ r⊗1），是唯一
+     * 需要上线的矩阵；{@code b} 为兼容保留的零宽占位，不承载任何协议数据。
+     * 本批次的 T 矩阵列被缓存供 {@link #deriveKey(int)} 使用，单批内存
+     * O(κ × 批大小)，与总条数无关。
      */
     public BatchColumns produceColumns(int globalStart, int batchLength) {
-        if (t0 == null || t1 == null) {
+        if (seed0 == null || seed1 == null) {
             throw new OtException(ErrorCode.INVALID_STATE, "基础串尚未生成");
         }
         if (batchLength <= 0 || globalStart < 0
@@ -101,44 +117,59 @@ public final class ExtensionReceiver {
             throw new OtException(ErrorCode.INVALID_PARAMETER, "批次范围非法");
         }
         int totalBytes = (batchLength * kappa + 7) / 8;
-        byte[][] aColumns = new byte[kappa][];
-        byte[][] bColumns = new byte[kappa][];
+        long streamOffset = (long) globalStart * kappa / Byte.SIZE;
+        byte[][] uColumns = new byte[kappa][];
+        byte[][] tColumns = new byte[kappa][];
         for (int j = 0; j < kappa; j++) {
-            byte[] a = new byte[totalBytes];
-            byte[] b = new byte[totalBytes];
+            byte[] t = StreamingPrg.expand(seed0[j], ExtensionSender.domainColumn(),
+                    streamOffset, totalBytes);
+            byte[] g = StreamingPrg.expand(seed1[j], ExtensionSender.domainColumn(),
+                    streamOffset, totalBytes);
+            byte[] u = SymCrypto.xor(t, g);
+            SymCrypto.wipe(g);
             for (int local = 0; local < batchLength; local++) {
-                int globalIndex = globalStart + local;
-                for (int k = 0; k < kappa; k++) {
-                    int bitIndex = local * kappa + k;
-                    boolean bit0 = bit(t0[j], k);
-                    boolean bit1 = bit(t1[j], k);
-                    boolean choice = choices[globalIndex] == 1;
-                    setBit(a, bitIndex, bit0);
-                    setBit(b, bitIndex, choice ? bit1 : bit0);
+                if (choices[globalStart + local] == 1) {
+                    for (int k = 0; k < kappa; k++) {
+                        flipBit(u, local * kappa + k);
+                    }
                 }
             }
-            aColumns[j] = a;
-            bColumns[j] = b;
+            uColumns[j] = u;
+            tColumns[j] = t;
         }
-        return new BatchColumns(aColumns, bColumns);
+        installTCache(globalStart, batchLength, tColumns);
+        return new BatchColumns(uColumns, emptyColumns());
     }
 
     /**
-     * 派生第 index 条被选 OT 的密钥：跨 κ 列收集 t0_j（r=0）或 t1_j（r=1）
-     * 的第 j 位组成行串后散列。
+     * 派生第 index 条被选 OT 的密钥：跨 κ 列收集 T 矩阵第 index 行的第 j 位
+     * 组成行串后散列。优先读取本批次缓存；缓存未覆盖时按全局流偏移重新展开。
      */
     public byte[] deriveKey(int index) {
-        if (t0 == null || t1 == null) {
+        if (seed0 == null || seed1 == null) {
             throw new OtException(ErrorCode.INVALID_STATE, "基础串尚未生成");
         }
         if (index < 0 || index >= choices.length) {
             throw new OtException(ErrorCode.OUT_OF_RANGE, "行索引越界: " + index);
         }
         byte[] row = new byte[kappa / 8];
-        for (int j = 0; j < kappa; j++) {
-            byte[] source = choices[index] == 0 ? t0[j] : t1[j];
-            if (bit(source, j)) {
-                row[j >>> 3] |= (byte) (1 << (7 - (j & 7)));
+        if (cachedT != null && index >= cachedStart
+                && index < cachedStart + cachedLength) {
+            int local = index - cachedStart;
+            for (int j = 0; j < kappa; j++) {
+                if (bit(cachedT[j], local * kappa + j)) {
+                    row[j >>> 3] |= (byte) (1 << (7 - (j & 7)));
+                }
+            }
+        } else {
+            for (int j = 0; j < kappa; j++) {
+                long bitPosition = (long) index * kappa + j;
+                byte[] block = StreamingPrg.expand(seed0[j],
+                        ExtensionSender.domainColumn(), bitPosition >>> 3, 1);
+                if ((block[0] & (1 << (7 - (bitPosition & 7)))) != 0) {
+                    row[j >>> 3] |= (byte) (1 << (7 - (j & 7)));
+                }
+                SymCrypto.wipe(block);
             }
         }
         byte[] domain = choices[index] == 0
@@ -159,37 +190,58 @@ public final class ExtensionReceiver {
     }
 
     public void wipe() {
-        if (t0 != null) {
-            for (byte[] seed : t0) {
-                SymCrypto.wipe(seed);
-            }
-        }
-        if (t1 != null) {
-            for (byte[] seed : t1) {
-                SymCrypto.wipe(seed);
-            }
-        }
-        t0 = null;
-        t1 = null;
+        wipeSeeds();
+        wipeTCache();
         Arrays.fill(choices, (byte) 0);
     }
 
-    private static byte[] complement(byte[] value) {
-        byte[] out = new byte[value.length];
-        for (int i = 0; i < value.length; i++) {
-            out[i] = (byte) ~value[i];
+    private void installTCache(int globalStart, int batchLength, byte[][] tColumns) {
+        wipeTCache();
+        cachedT = tColumns;
+        cachedStart = globalStart;
+        cachedLength = batchLength;
+    }
+
+    private void wipeSeeds() {
+        if (seed0 != null) {
+            for (byte[] seed : seed0) {
+                SymCrypto.wipe(seed);
+            }
         }
-        return out;
+        if (seed1 != null) {
+            for (byte[] seed : seed1) {
+                SymCrypto.wipe(seed);
+            }
+        }
+        seed0 = null;
+        seed1 = null;
+    }
+
+    private void wipeTCache() {
+        if (cachedT != null) {
+            for (byte[] column : cachedT) {
+                SymCrypto.wipe(column);
+            }
+        }
+        cachedT = null;
+        cachedStart = 0;
+        cachedLength = 0;
+    }
+
+    private byte[][] emptyColumns() {
+        byte[][] columns = new byte[kappa][];
+        for (int j = 0; j < kappa; j++) {
+            columns[j] = new byte[0];
+        }
+        return columns;
     }
 
     private static boolean bit(byte[] data, int index) {
         return (data[index >>> 3] & (1 << (7 - (index & 7)))) != 0;
     }
 
-    private static void setBit(byte[] data, int index, boolean value) {
-        if (value) {
-            data[index >>> 3] |= (byte) (1 << (7 - (index & 7)));
-        }
+    private static void flipBit(byte[] data, int index) {
+        data[index >>> 3] ^= (byte) (1 << (7 - (index & 7)));
     }
 
     public record BatchColumns(byte[][] a, byte[][] b) {

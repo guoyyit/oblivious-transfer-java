@@ -7,22 +7,26 @@ import com.github.guoyyit.oblivioustransferjava.ot.protocol.OtException;
 import java.security.SecureRandom;
 
 /**
- * IKNP 随机 OT 扩展发送方（原版 κ 位向量构造，仅对称原语）。
+ * IKNP 随机 OT 扩展发送方（PRG 掩码构造，仅对称原语）。
  *
- * <p>基础阶段发送方扮演接收方，选择向量 s ∈ {{0,1}}^κ，对每个基础 OT j
- * 取回 κ 位串 x_j。扩展阶段接收方对每列 j 发送 n×κ 位：
+ * <p>基础阶段发送方扮演接收方，选择向量 s ∈ {0,1}^κ，对每个基础 OT j 取回
+ * κ 位种子 k_{s_j}。扩展阶段接收方对每列 j 只发送一个 n批×κ 位掩码矩阵列
  * <pre>
- *   u_j = t0_j ⊕ (r_n ⊗ 1_κ) ⊕ t0_j ... 即两矩阵
- *   A 列 j = t0_j（对所有行 i 相同的 κ 位）
- *   B 列 j = t0_j ⊕ (r_i 重复 κ 次)（随 i 变化）
+ *   u_j = G(k0_j) ⊕ G(k1_j) ⊕ (r ⊗ 1_κ)
  * </pre>
- * 发送方按 s_j 选择 A 或 B，得到串 x_j，并对每条 OT i 跨 κ 列恢复行
- * R_i（满足 R_i 的第 j 位 = t0_{j,i} ⊕ s_j·r_i）。输出相关随机串对
+ * 发送方按列计算 q_j = (s_j ? u_j : 0) ⊕ G(k_{s_j})，于是 q_j = t_j ⊕ (s_j·r)
+ * （t_j = G(k0_j)），并对每条 OT i 跨 κ 列恢复行 R_i（第 j 位取自第 j 列的
+ * 第 i·κ+j 位）。输出相关随机串对
  * <pre>
  *   k_i^0 = H(i, R_i),  k_i^1 = H(i, R_i ⊕ s)
  * </pre>
- * 接收方 r_i=0 持有 R_i，r_i=1 持有 R_i⊕s。分批时每批临时内存为
- * O(批大小 × κ) 位，与 n 无关。
+ * 接收方 r_i=0 持有 R_i，r_i=1 持有 R_i⊕s。
+ *
+ * <p>选择隐私：对任意列 j，发送方只持有 k0_j、k1_j 之一，u_j 中始终残留一个
+ * 它无法重构的 PRG 输出作为掩码；在 PRG 不可区分性假设下，发送方视图不泄漏
+ * 选择向量的任何信息（与逐次执行基础 OT 同等强度的计算安全性）。分批时按
+ * 全局流偏移展开，单批临时内存 O(批大小 × κ) 位，与 n 无关，且批次边界不
+ * 改变任何比特。
  */
 public final class ExtensionSender {
 
@@ -30,12 +34,14 @@ public final class ExtensionSender {
 
     private static final byte[] DOMAIN_ROW0 = {'i', 'k', 'n', 'p', '-', 'r', 'o', 'w', '0'};
     private static final byte[] DOMAIN_ROW1 = {'i', 'k', 'n', 'p', '-', 'r', 'o', 'w', '1'};
+    private static final byte[] DOMAIN_COLUMN = {'i', 'k', 'n', 'p', '-', 'c', 'o', 'l'};
     private static final byte[] HKDF_INFO = {'i', 'k', 'n', 'p', '-', 'r', 'o', 'w'};
 
     private final int kappa;
     private final SecureRandom random;
 
     private boolean[] s;
+    private byte[][] chosen;
 
     public ExtensionSender(int kappa, SecureRandom random) {
         if (kappa <= 0 || kappa % 8 != 0) {
@@ -70,7 +76,7 @@ public final class ExtensionSender {
     }
 
     /**
-     * 保存基础 OT 取回的 κ 位串（按 s_j 选择的那一份）。
+     * 保存基础 OT 取回的 κ 位种子（按 s_j 选择的那一份，即 k_{s_j}）。
      */
     public void installBaseStrings(byte[][] received) {
         if (s == null) {
@@ -92,45 +98,72 @@ public final class ExtensionSender {
         installBaseStrings(received);
     }
 
-    private byte[][] chosen;
-
     /**
      * 处理一个扩展批次。
      *
      * @param globalStart 批起始全局索引
      * @param totalN      全部 OT 条数
-     * @param aColumns    接收方矩阵 A 的 κ 列，每列 ceil(batch*κ/8) 字节，
-     *                     行主序：第 local 行的 κ 位连续
-     * @param bColumns    接收方矩阵 B 的 κ 列（同上布局）
+     * @param uColumns    接收方 u 矩阵的 κ 列，每列 ceil(batch*κ/8) 字节，
+     *                    行主序：第 local 行的 κ 位连续
+     * @param placeholder 兼容保留的第二矩阵槽位：必须为 κ 个零宽列；携带任何
+     *                    非空内容（旧版双矩阵格式）一律按协议违规拒绝
      */
     public RowPair[] deriveBatch(int globalStart, int totalN,
-                                 byte[][] aColumns, byte[][] bColumns) {
+                                 byte[][] uColumns, byte[][] placeholder) {
         if (chosen == null || s == null) {
             throw new OtException(ErrorCode.INVALID_STATE, "基础串尚未装配");
         }
-        if (aColumns == null || bColumns == null
-                || aColumns.length != kappa || bColumns.length != kappa) {
+        if (uColumns == null || uColumns.length != kappa) {
             throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列数必须等于 kappa");
         }
-        int batchLength = inferBatch(aColumns[0].length);
+        if (placeholder == null || placeholder.length != kappa) {
+            throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "占位矩阵列数必须等于 kappa");
+        }
+        for (int j = 0; j < kappa; j++) {
+            if (placeholder[j] == null || placeholder[j].length != 0) {
+                throw new OtException(ErrorCode.PROTOCOL_VIOLATION,
+                        "第二矩阵槽位必须为空（协议只承载单个掩码矩阵）");
+            }
+        }
+        return deriveFromMask(globalStart, totalN, uColumns);
+    }
+
+    /**
+     * 单矩阵形式：只携带 u 矩阵列的扩展批次。
+     */
+    public RowPair[] deriveBatch(int globalStart, int totalN, byte[][] uColumns) {
+        if (chosen == null || s == null) {
+            throw new OtException(ErrorCode.INVALID_STATE, "基础串尚未装配");
+        }
+        if (uColumns == null || uColumns.length != kappa) {
+            throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列数必须等于 kappa");
+        }
+        return deriveFromMask(globalStart, totalN, uColumns);
+    }
+
+    private RowPair[] deriveFromMask(int globalStart, int totalN, byte[][] uColumns) {
+        int batchLength = inferBatch(uColumns[0].length);
         if (batchLength <= 0 || globalStart < 0
                 || globalStart + batchLength > totalN) {
             throw new OtException(ErrorCode.OUT_OF_RANGE, "扩展批次范围越界");
+        }
+        int expectedBytes = (batchLength * kappa + 7) / 8;
+        long streamOffset = (long) globalStart * kappa / Byte.SIZE;
+        byte[][] qColumns = new byte[kappa][];
+        for (int j = 0; j < kappa; j++) {
+            if (uColumns[j] == null || uColumns[j].length != expectedBytes) {
+                throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列宽不一致");
+            }
+            byte[] g = StreamingPrg.expand(chosen[j], DOMAIN_COLUMN,
+                    streamOffset, expectedBytes);
+            qColumns[j] = s[j] ? SymCrypto.xor(uColumns[j], g) : g;
         }
         RowPair[] rows = new RowPair[batchLength];
         for (int local = 0; local < batchLength; local++) {
             int globalIndex = globalStart + local;
             byte[] rowR = new byte[kappa / 8];
             for (int j = 0; j < kappa; j++) {
-                int expectedBytes = (batchLength * kappa + 7) / 8;
-                if (aColumns[j] == null || aColumns[j].length != expectedBytes
-                        || bColumns[j] == null || bColumns[j].length != expectedBytes) {
-                    throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列宽不一致");
-                }
-                byte[][] picked = s[j] ? aColumns : bColumns;
-                // 从该列第 local 行第 j 位取值（行主序 local*kappa + j）
-                boolean value = bit(picked[j], local * kappa + j);
-                if (value) {
+                if (bit(qColumns[j], local * kappa + j)) {
                     rowR[j >>> 3] |= (byte) (1 << (7 - (j & 7)));
                 }
             }
@@ -139,15 +172,12 @@ public final class ExtensionSender {
                     hashRow(rowR, globalIndex, totalN, DOMAIN_ROW0),
                     hashRow(rowRxorS, globalIndex, totalN, DOMAIN_ROW1));
             SymCrypto.wipe(rowRxorS);
+            SymCrypto.wipe(rowR);
+        }
+        for (byte[] column : qColumns) {
+            SymCrypto.wipe(column);
         }
         return rows;
-    }
-
-    /**
-     * 兼容单矩阵 PRG 变体的占位（批处理层不再使用）。
-     */
-    public RowPair[] deriveBatch(int globalStart, int totalN, byte[][] single) {
-        throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "需要 A/B 两个矩阵");
     }
 
     private int inferBatch(int columnBytes) {
@@ -166,6 +196,10 @@ public final class ExtensionSender {
 
     private static boolean bit(byte[] data, int index) {
         return (data[index >>> 3] & (1 << (7 - (index & 7)))) != 0;
+    }
+
+    static byte[] domainColumn() {
+        return DOMAIN_COLUMN;
     }
 
     static byte[] hashRow(byte[] rowBits, int globalIndex, int totalN, byte[] domain) {
