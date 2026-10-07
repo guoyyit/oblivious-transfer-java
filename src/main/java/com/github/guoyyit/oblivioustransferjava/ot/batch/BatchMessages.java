@@ -41,36 +41,33 @@ final class BatchMessages {
         return new Commitment(n, commitment);
     }
 
-    static byte[] encodeMatrixPair(int globalStart, byte[][] aColumns, byte[][] bColumns) {
+    /**
+     * 扩展批次矩阵编码：修复后线上只传输 IKNP 的 U 矩阵（κ 列），
+     * 不再发送第二个矩阵，选择位由接收方私有 PRG 种子掩码。
+     */
+    static byte[] encodeMatrix(int globalStart, byte[][] uColumns) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         writeInt(out, globalStart);
-        writeInt(out, aColumns.length);
-        for (byte[] column : aColumns) {
-            writeLargeBlock(out, column);
-        }
-        for (byte[] column : bColumns) {
+        writeInt(out, uColumns.length);
+        for (byte[] column : uColumns) {
             writeLargeBlock(out, column);
         }
         return out.toByteArray();
     }
 
-    static MatrixPair decodeMatrixPair(byte[] body, int expectedKappa) {
+    static Matrix decodeMatrix(byte[] body, int expectedKappa) {
         Reader reader = new Reader(body);
         int globalStart = reader.readInt();
         int kappa = reader.readInt();
         if (kappa != expectedKappa) {
             throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列数与 kappa 不符");
         }
-        byte[][] aColumns = new byte[kappa][];
-        byte[][] bColumns = new byte[kappa][];
+        byte[][] uColumns = new byte[kappa][];
         for (int j = 0; j < kappa; j++) {
-            aColumns[j] = reader.readLargeBlock();
-        }
-        for (int j = 0; j < kappa; j++) {
-            bColumns[j] = reader.readLargeBlock();
+            uColumns[j] = reader.readLargeBlock();
         }
         reader.requireEnd();
-        return new MatrixPair(globalStart, aColumns, bColumns);
+        return new Matrix(globalStart, uColumns);
     }
 
     static byte[] encodeRedemption(int globalStart, int count) {
@@ -190,7 +187,7 @@ final class BatchMessages {
     record Commitment(int n, byte[] commitment) {
     }
 
-    record MatrixPair(int globalStart, byte[][] a, byte[][] b) {
+    record Matrix(int globalStart, byte[][] columns) {
     }
 
     record Redemption(int globalStart, int count) {

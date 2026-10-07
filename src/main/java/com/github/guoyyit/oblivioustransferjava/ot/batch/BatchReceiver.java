@@ -86,7 +86,10 @@ public final class BatchReceiver extends ProtocolEndpoint {
             this.n = totalN;
             this.cursor = 0;
 
-            byte[] commitment = SymCrypto.sha256(buildCommitmentMaterial(totalN, choices));
+            byte[] salt = new byte[32];
+            random.nextBytes(salt);
+            byte[] commitment =
+                    SymCrypto.sha256(buildCommitmentMaterial(totalN, salt, choices));
             send(BatchMessages.MSG_COMMIT,
                     BatchMessages.encodeCommitment(totalN, commitment));
         } catch (OtException e) {
@@ -124,7 +127,7 @@ public final class BatchReceiver extends ProtocolEndpoint {
             ExtensionReceiver.BatchColumns columns =
                     extension.produceColumns(start, count);
             send(BatchMessages.MSG_T_COLUMNS,
-                    BatchMessages.encodeMatrixPair(start, columns.a(), columns.b()));
+                    BatchMessages.encodeMatrix(start, columns.a()));
             send(BatchMessages.MSG_REDEMPTION,
                     BatchMessages.encodeRedemption(start, count));
 
@@ -178,9 +181,17 @@ public final class BatchReceiver extends ProtocolEndpoint {
         abort(ErrorCode.CANCELLED, "接收方取消会话");
     }
 
-    private static byte[] buildCommitmentMaterial(int totalN, byte[] choices) {
-        ByteBuffer buffer = ByteBuffer.allocate(4 + choices.length);
+    /**
+     * 选择向量承诺：SHA-256(domain ‖ n ‖ salt ‖ choices)。盐为每次会话
+     * 重新生成的 256 位随机数，使承诺对发送方计算隐藏（全零/全一等
+     * 结构化向量也无法被穷举验证）；承诺本身不随选择向量变化而偏斜。
+     */
+    private static byte[] buildCommitmentMaterial(int totalN, byte[] salt, byte[] choices) {
+        byte[] domain = {'o', 't', '-', 'c', 'o', 'm', 'm', 'i', 't', '-', 'v', '2'};
+        ByteBuffer buffer = ByteBuffer.allocate(domain.length + 4 + salt.length + choices.length);
+        buffer.put(domain);
         buffer.putInt(totalN);
+        buffer.put(salt);
         buffer.put(choices);
         return buffer.array();
     }

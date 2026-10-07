@@ -7,22 +7,25 @@ import com.github.guoyyit.oblivioustransferjava.ot.protocol.OtException;
 import java.security.SecureRandom;
 
 /**
- * IKNP 随机 OT 扩展发送方（原版 κ 位向量构造，仅对称原语）。
+ * IKNP 随机 OT 扩展发送方（PRG 种子构造，仅对称原语）。
  *
- * <p>基础阶段发送方扮演接收方，选择向量 s ∈ {{0,1}}^κ，对每个基础 OT j
- * 取回 κ 位串 x_j。扩展阶段接收方对每列 j 发送 n×κ 位：
+ * <p>基础阶段发送方扮演接收方，选择向量 s ∈ {0,1}^κ，对每个基础 OT j
+ * 取回 κ 位种子 k_{s_j,j}（配对种子 k_{1-s_j,j} 对其不可知）。
+ * 扩展阶段接收方对每列 j 只发送一个矩阵列：
  * <pre>
- *   u_j = t0_j ⊕ (r_n ⊗ 1_κ) ⊕ t0_j ... 即两矩阵
- *   A 列 j = t0_j（对所有行 i 相同的 κ 位）
- *   B 列 j = t0_j ⊕ (r_i 重复 κ 次)（随 i 变化）
+ *   U_j = G(k0_j) ⊕ G(k1_j) ⊕ (r ⊗ 1_κ)
  * </pre>
- * 发送方按 s_j 选择 A 或 B，得到串 x_j，并对每条 OT i 跨 κ 列恢复行
- * R_i（满足 R_i 的第 j 位 = t0_{j,i} ⊕ s_j·r_i）。输出相关随机串对
+ * 发送方按列计算 Q_j = G(k_{s_j,j}) ⊕ (s_j ? U_j : 0)，于是
+ * Q 的第 i 行 = T0 第 i 行 ⊕ (r_i·s)。对每条 OT i 输出相关随机串对
  * <pre>
- *   k_i^0 = H(i, R_i),  k_i^1 = H(i, R_i ⊕ s)
+ *   k_i^0 = H(i, Q_i),  k_i^1 = H(i, Q_i ⊕ s)
  * </pre>
- * 接收方 r_i=0 持有 R_i，r_i=1 持有 R_i⊕s。分批时每批临时内存为
- * O(批大小 × κ) 位，与 n 无关。
+ * 接收方无论 r_i 为何都持有 T0 第 i 行，恰好恢复被选那一项。
+ *
+ * <p>选择隐私：U_j 被发送方不可知的 PRG 流 G(k_{1-s_j,j}) 一次性掩码，
+ * 发送方视图（基础阶段状态、随机源与全部收到的协议消息）与选择向量独立，
+ * 安全性归约为 PRG 伪随机性与基础 OT 的发送方隐私，与逐次执行基础 OT 同强度。
+ * 分批时每批临时内存为 O(批大小 × κ) 位，与 n 无关。
  */
 public final class ExtensionSender {
 
@@ -36,6 +39,7 @@ public final class ExtensionSender {
     private final SecureRandom random;
 
     private boolean[] s;
+    private byte[][] chosen;
 
     public ExtensionSender(int kappa, SecureRandom random) {
         if (kappa <= 0 || kappa % 8 != 0) {
@@ -70,88 +74,105 @@ public final class ExtensionSender {
     }
 
     /**
-     * 保存基础 OT 取回的 κ 位串（按 s_j 选择的那一份）。
+     * 保存基础 OT 取回的 κ 位种子（按 s_j 选择的那一份）。
      */
-    public void installBaseStrings(byte[][] received) {
+    public void installBaseSeeds(byte[][] received) {
         if (s == null) {
             throw new OtException(ErrorCode.INVALID_STATE, "尚未生成选择向量 s");
         }
         if (received == null || received.length != kappa) {
-            throw new OtException(ErrorCode.INVALID_PARAMETER, "基础串数量必须等于 kappa");
+            throw new OtException(ErrorCode.INVALID_PARAMETER, "基础种子数量必须等于 kappa");
         }
         chosen = new byte[kappa][];
         for (int j = 0; j < kappa; j++) {
             if (received[j] == null || received[j].length != seedBytes()) {
-                throw new OtException(ErrorCode.INVALID_PARAMETER, "基础串长度非法");
+                throw new OtException(ErrorCode.INVALID_PARAMETER, "基础种子长度非法");
             }
             chosen[j] = received[j].clone();
         }
     }
 
-    public void installBaseSeeds(byte[][] received) {
-        installBaseStrings(received);
+    public void installBaseStrings(byte[][] received) {
+        installBaseSeeds(received);
     }
-
-    private byte[][] chosen;
 
     /**
      * 处理一个扩展批次。
      *
      * @param globalStart 批起始全局索引
      * @param totalN      全部 OT 条数
-     * @param aColumns    接收方矩阵 A 的 κ 列，每列 ceil(batch*κ/8) 字节，
-     *                     行主序：第 local 行的 κ 位连续
-     * @param bColumns    接收方矩阵 B 的 κ 列（同上布局）
+     * @param uColumns    接收方 U 矩阵的 κ 列，每列 batch*κ/8 字节，
+     *                    行主序：第 local 行的 κ 位连续
+     * @param unused      兼容旧双矩阵调用的占位参数，忽略（可为 null）；
+     *                    修复后发送方只接收 U 一个矩阵
      */
     public RowPair[] deriveBatch(int globalStart, int totalN,
-                                 byte[][] aColumns, byte[][] bColumns) {
+                               byte[][] uColumns, byte[][] unused) {
         if (chosen == null || s == null) {
-            throw new OtException(ErrorCode.INVALID_STATE, "基础串尚未装配");
+            throw new OtException(ErrorCode.INVALID_STATE, "基础种子尚未装配");
         }
-        if (aColumns == null || bColumns == null
-                || aColumns.length != kappa || bColumns.length != kappa) {
+        if (uColumns == null || uColumns.length != kappa) {
             throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列数必须等于 kappa");
         }
-        int batchLength = inferBatch(aColumns[0].length);
-        if (batchLength <= 0 || globalStart < 0
-                || globalStart + batchLength > totalN) {
+        if (uColumns[0] == null) {
+            throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列不能为空");
+        }
+        int columnBytes = uColumns[0].length;
+        if (columnBytes <= 0 || columnBytes % seedBytes() != 0) {
+            throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列宽与 kappa 不对齐");
+        }
+        int batchLength = columnBytes / seedBytes();
+        if (globalStart < 0 || globalStart + batchLength > totalN) {
             throw new OtException(ErrorCode.OUT_OF_RANGE, "扩展批次范围越界");
         }
-        RowPair[] rows = new RowPair[batchLength];
-        for (int local = 0; local < batchLength; local++) {
-            int globalIndex = globalStart + local;
-            byte[] rowR = new byte[kappa / 8];
+        int expectedBytes = batchLength * seedBytes();
+        long batchByteOffset = (long) globalStart * seedBytes();
+
+        byte[][] qColumns = new byte[kappa][];
+        try {
             for (int j = 0; j < kappa; j++) {
-                int expectedBytes = (batchLength * kappa + 7) / 8;
-                if (aColumns[j] == null || aColumns[j].length != expectedBytes
-                        || bColumns[j] == null || bColumns[j].length != expectedBytes) {
+                if (uColumns[j] == null || uColumns[j].length != expectedBytes) {
                     throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "矩阵列宽不一致");
                 }
-                byte[][] picked = s[j] ? aColumns : bColumns;
-                // 从该列第 local 行第 j 位取值（行主序 local*kappa + j）
-                boolean value = bit(picked[j], local * kappa + j);
-                if (value) {
-                    rowR[j >>> 3] |= (byte) (1 << (7 - (j & 7)));
+                byte[] q = StreamingPrg.expand(
+                        chosen[j], StreamingPrg.columnDomain(j), batchByteOffset, expectedBytes);
+                if (s[j]) {
+                    for (int i = 0; i < q.length; i++) {
+                        q[i] ^= uColumns[j][i];
+                    }
                 }
+                qColumns[j] = q;
             }
-            byte[] rowRxorS = xorS(rowR);
-            rows[local] = new RowPair(
-                    hashRow(rowR, globalIndex, totalN, DOMAIN_ROW0),
-                    hashRow(rowRxorS, globalIndex, totalN, DOMAIN_ROW1));
-            SymCrypto.wipe(rowRxorS);
+
+            RowPair[] rows = new RowPair[batchLength];
+            for (int local = 0; local < batchLength; local++) {
+                int globalIndex = globalStart + local;
+                byte[] rowR = new byte[kappa / 8];
+                for (int j = 0; j < kappa; j++) {
+                    if (bit(qColumns[j], local * kappa + j)) {
+                        rowR[j >>> 3] |= (byte) (1 << (7 - (j & 7)));
+                    }
+                }
+                byte[] rowRxorS = xorS(rowR);
+                rows[local] = new RowPair(
+                        hashRow(rowR, globalIndex, totalN, DOMAIN_ROW0),
+                        hashRow(rowRxorS, globalIndex, totalN, DOMAIN_ROW1));
+                SymCrypto.wipe(rowRxorS);
+                SymCrypto.wipe(rowR);
+            }
+            return rows;
+        } finally {
+            for (byte[] q : qColumns) {
+                SymCrypto.wipe(q);
+            }
         }
-        return rows;
     }
 
     /**
      * 兼容单矩阵 PRG 变体的占位（批处理层不再使用）。
      */
     public RowPair[] deriveBatch(int globalStart, int totalN, byte[][] single) {
-        throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "需要 A/B 两个矩阵");
-    }
-
-    private int inferBatch(int columnBytes) {
-        return columnBytes * 8 / kappa;
+        throw new OtException(ErrorCode.PROTOCOL_VIOLATION, "需要 U 矩阵列参数");
     }
 
     private byte[] xorS(byte[] row) {

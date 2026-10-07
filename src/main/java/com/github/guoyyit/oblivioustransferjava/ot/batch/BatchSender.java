@@ -25,8 +25,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * <ol>
  *   <li>基础阶段：与接收方执行 {@code kappa} 组基础 OT，发送方扮演接收方，
  *       按随机向量 u 取回 {@code kappa} 个 16 字节种子（离散对数假设保证安全）；</li>
- *   <li>扩展+兑换阶段：接收方先提交 n 与选择向量承诺，之后按批推进。每个批次
- *       接收方发送该批 T 矩阵列，紧接着发送该批的兑换请求（长度必须与 T 批一致，
+ *   <li>扩展+兑换阶段：接收方先提交 n 与带盐选择向量承诺，之后按批推进。
+ *       每个批次接收方只发送该批 IKNP U 矩阵列（选择位被发送方不可知的
+ *       PRG 流一次性掩码），紧接着发送该批的兑换请求（长度必须与矩阵批一致，
  *       且严格按顺序），发送方仅用 PRG/HMAC/HKDF 等对称原语派生该批行密钥，
  *       用 AES-GCM 加密消息对并擦除临时列。</li>
  * </ol>
@@ -119,19 +120,19 @@ public final class BatchSender extends ProtocolEndpoint {
 
         while (extensionCursor < n) {
             byte[] matrixBody = receive(BatchMessages.MSG_T_COLUMNS);
-            BatchMessages.MatrixPair matrix =
-                    BatchMessages.decodeMatrixPair(matrixBody, config.securityBits());
+            BatchMessages.Matrix matrix =
+                    BatchMessages.decodeMatrix(matrixBody, config.securityBits());
             if (matrix.globalStart() != extensionCursor) {
                 throw new OtException(ErrorCode.INDEX_MISMATCH,
                         "扩展批次起始错位 expected=" + extensionCursor
                                 + " actual=" + matrix.globalStart());
             }
-            int batchLength = matrix.a()[0].length * 8 / config.securityBits();
+            int batchLength = matrix.columns()[0].length * 8 / config.securityBits();
             if (batchLength <= 0 || extensionCursor + batchLength > n) {
                 throw new OtException(ErrorCode.OUT_OF_RANGE, "扩展批次越界");
             }
             ExtensionSender.RowPair[] rows = extension.deriveBatch(
-                    extensionCursor, n, matrix.a(), matrix.b());
+                    extensionCursor, n, matrix.columns(), null);
 
             byte[] redemptionBody = receive(BatchMessages.MSG_REDEMPTION);
             BatchMessages.Redemption request =
